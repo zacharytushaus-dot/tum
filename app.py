@@ -37,6 +37,12 @@ def pct_slider(label, *, min_pct=0.0, max_pct=100.0, value_pct=0.0,
     v = (st.sidebar.slider(**args) if sidebar else st.slider(**args))
     return v / 100.0  # normalize to 0–1 for the engine
 
+# ---------- Hazard-dose helper ----------
+def _apply_dose_log(hr_full: float, a: float) -> float:
+    """Scale a hazard ratio by exposure fraction a in [0,1] on the log scale."""
+    a = max(0.0, min(1.0, float(a)))
+    return float(hr_full) ** a
+
 def pct_number(label, *, value_pct=0.0, step_pct=0.1, key=None, help=None,
                sidebar=True, period=None, min_pct=0.0, max_pct=100.0,
                digits=None, fmt=None):
@@ -68,16 +74,17 @@ if "results" not in st.session_state:
 
 st.title("Time Utility Model")
 
-# ------------------ Sidebar: profile & presets ------------------
-st.sidebar.header("1) Your Profile & Presets")
+# ------------------ Sidebar: profile & lifestyle types ------------------
+st.sidebar.header("1) Your Demographics")
 
 age = st.sidebar.number_input("Your Age", min_value=18, max_value=95, value=21, step=1)
 sex = st.sidebar.selectbox("Sex", ["Male", "Female"])
 
 preset = st.sidebar.selectbox(
-    "Preset",
-    ["None", "Athlete", "Budget Health", "Max Longevity"],
-    index=1
+    "Preset Habits",
+    ["None", "Core Routine", "Active Routine", "Longevity Protocol", "Bad Idea Mode"],
+    index=0,
+    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after."
 )
 
 # Default risk multipliers (HR×adherence at 100%)
@@ -88,16 +95,17 @@ BASE_RISK_MULT = {
     "Mediterranean Diet": 0.77,
     "Meditation": 0.93,
     "Red-Light Therapy": 0.98,
-    "Smoking Currently": 2.5, # harmful, editable in UI later if we want
+    "Heavy Smoking": 2.5, # harmful, editable in UI later if we want
     "Heavy Drinking": 1.25, # 3-4 drinks/day; use 1.35 for "very heavy"
 }
 
 # Preset → default toggle set
 PRESET_TOGGLES = {
-    "None":               {"Consistent Sleep": False, "Frequent Exercise": False, "Mediterranean Diet": False, "Meditation": False, "Red-Light Therapy": False, "Frequent Sauna": False, "Smoking Currently": False, "Heavy Drinking": False},
-    "Athlete":            {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": True,  "Meditation": True,  "Red-Light Therapy": False, "Frequent Sauna": False, "Smoking Currently": False, "Heavy Drinking": False},
-    "Budget Health":      {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": False, "Meditation": True,  "Red-Light Therapy": False, "Frequent Sauna": False, "Smoking Currently": False, "Heavy Drinking": False},
-    "Max Longevity":      {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": True,  "Meditation": True,  "Red-Light Therapy": True, "Frequent Sauna": True, "Smoking Currently": False, "Heavy Drinking": False},
+    "None":               {"Consistent Sleep": False, "Frequent Exercise": False, "Mediterranean Diet": False, "Meditation": False, "Red-Light Therapy": False, "Frequent Sauna": False, "Heavy Smoking": False, "Heavy Drinking": False},
+    "Core Routine":            {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": False,  "Meditation": False,  "Red-Light Therapy": False, "Frequent Sauna": False, "Heavy Smoking": False, "Heavy Drinking": False},
+    "Active Routine":      {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": True, "Meditation": True,  "Red-Light Therapy": False, "Frequent Sauna": False, "Heavy Smoking": False, "Heavy Drinking": False},
+    "Longevity Protocol":      {"Consistent Sleep": True,  "Frequent Exercise": True,  "Mediterranean Diet": True,  "Meditation": True,  "Red-Light Therapy": True, "Frequent Sauna": True, "Heavy Smoking": False, "Heavy Drinking": False},
+    "Bad Idea Mode":      {"Consistent Sleep": False,  "Frequent Exercise": False,  "Mediterranean Diet": False,  "Meditation": False,  "Red-Light Therapy": False, "Frequent Sauna": False, "Heavy Smoking": True, "Heavy Drinking": True}
 }
 
 st.sidebar.header("2) Your Health Habits")
@@ -109,6 +117,27 @@ adherence = pct_slider("Adherence to your habits",
                        value_pct=75.0, step_pct=5.0, digits=0,)
 st.sidebar.caption("How likely you are to commit to your habits")
 
+# --- Harmful habit intensity (only shows if the toggle is on) ---
+st.sidebar.subheader("Harmful habit intensity")
+
+# Defaults so variables exist even if sliders do not render
+smoke_exposure = 0.0
+drink_exposure = 0.0
+
+if toggles.get("Heavy Smoking", False):
+    smoke_exposure = pct_slider(
+        "Smoking Intensity",
+        value_pct=100.0, step_pct=10.0, digits=0,
+        help="Percent of time you meet your 'heavy smoking' definition."
+    )
+
+if toggles.get("Heavy Drinking", False):
+    drink_exposure = pct_slider(
+        "Drinking Intensity",
+        value_pct=100.0, step_pct=10.0, digits=0,
+        help="Percent of time you meet your 'heavy drinking' definition."
+    )
+
 # --- Weight status (mutually exclusive) ---
 st.sidebar.subheader("Weight status")
 weight_label = st.sidebar.selectbox(
@@ -118,7 +147,7 @@ weight_label = st.sidebar.selectbox(
      "High Body Weight (BMI 30-34.9)",
      "Very High Body Weight (BMI ≥35)"],
     index=0,
-    help="If BMI misfits you (very muscular), use waist guidance: central obesity ≈ waist-to-height ≥0.60 or large waist (≥102 cm men, ≥88 cm women)."
+    help="If BMI doesn't fit you (e.g., very muscular), use waist instead: central obesity = waist-to-height ≥ 0.6 or waist ≥ 102 cm (men) / 88 cm (women)."
 )
 
 WEIGHT_HR = {
@@ -138,7 +167,7 @@ CANON = {
     "Mediterranean Diet":       "mediterraneandiet",
     "Meditation":               "meditation",
     "Red-Light Therapy":        "redlight",
-    "Smoking Currently":        "smoker",
+    "Heavy Smoking":            "smoker",
     "Heavy Drinking":           "heavyalcohol",
     "Weight status":            "weight",
 }
@@ -156,8 +185,14 @@ for name, base in BASE_RISK_MULT.items():
         # Protective habit → scale by adherence (80% adherence = 80% of the benefit)
         m = 1.0 - adherence * (1.0 - base)
     else:
-        # Harmful exposure → do NOT scale by adherence
-        m = float(base)
+        # Harmful exposure → scale by exposure on the log-hazard scale
+        if key == "smoker":
+            a = smoke_exposure
+        elif key == "heavyalcohol":
+            a = drink_exposure
+        else:
+            a = 1.0  # fallback for any future harmfuls lacking a slider
+        m = _apply_dose_log(base, a)
 
     lifestyle_HRs[key] = float(m)
 
@@ -254,7 +289,7 @@ st.sidebar.header("5) Longevity Parameters")
 lambda_plateau = st.sidebar.number_input("Late-age Risk Plateau λ", min_value=0.0, max_value=5.0, value=0.6, step=0.05)
 drift_days = st.sidebar.number_input("Frontier Age Drift (days per year)", min_value=0.0, max_value=200.0, value=15.0, step=1.0)
 le_improve = pct_slider("Life Expectancy Growth", min_pct=0.0, max_pct=2.0,
-                        value_pct=0.2, step_pct=0.5, digits=1, period="per year")
+                        value_pct=0.2, step_pct=0.1, digits=2, period="per year")
 max_age_today = st.sidebar.number_input("Frontier Age Today", min_value=100.0, max_value=130.0, value=119.0, step=0.5)
 
 # ------------------ Sidebar: simulation ------------------
@@ -304,7 +339,7 @@ else:
 
     with col1:
         st.metric(
-            "Projected Life (median)",
+            "Predicted lifespan (median)",
             f"{median_life:.0f} years",
             help="The age when your biological age first equals or exceeds society's average life-expectancy for that calendar year"
         )
@@ -324,9 +359,9 @@ exp_tech_by_age = (out["tech_years_by_age"] * alive_mask).mean(axis=0)
 yrs_from_tech = float(np.sum(exp_tech_by_age))
 
 with col2:
-    st.metric("Net Worth (median, $MM)", f"{median_net:,.2f}")
+    st.metric("Net worth (median, $MM)", f"{median_net:,.2f}")
     st.metric(
-        "Years from your habits (expected)",
+        "Years from habits (expected)",
         f"{yrs_from_habits:.1f} years",
         help="Expected years added from your current health habits, integrated over your lifetime."
     )
@@ -349,15 +384,15 @@ ctrl_l, ctrl_r = st.columns(2)
 with ctrl_l:
     hist_mode = st.radio(
         "How should we simulate lifespans?",
-        ["Random chance each year", "Health threshold (no dice)"],
+        ["Random chance each year", "Predicted Lifespan"],
         index=1,  # default to deterministic
         help=("Random chance each year: we roll the dice on survival each simulated year based on your risk profile. "
-              "Health threshold (no dice): we assume death the moment your projected health age meets the average "
-              "life expectancy for that calendar year (no randomness).")
+              "Predicted Lifespan: we assume death the moment your biological age meets the exceeds society's "
+              "life expectancy for that calendar year.")
     )
 
 with ctrl_r:
-    view = st.radio("Wealth view", ["Scatter", "Heatmap"], index=0, horizontal=True)
+    view = st.radio("Wealth View", ["Scatter", "Heatmap"], index=0, horizontal=True)
 
 # Tiny spacer so charts don’t collide with radios
 st.write("")
@@ -370,14 +405,14 @@ if hist_mode == "Random chance each year":
     nbins = int(np.ptp(life_data)) + 1 if np.ptp(life_data) >= 1 else 10
     fig_life = px.histogram(
         life_data, nbins=nbins, title=life_title,
-        labels={"value": "Age at death (years)", "count": "Simulations"}
+        labels={"value": "Age at death (years)", "Count": "Simulations"}
     )
 else:
     life_data = out.get("projected_life_frac", out["projected_life"])
-    life_title = "Projected age at health threshold"
+    life_title = "Predicted Lifespan"
     fig_life = px.histogram(
         life_data, title=life_title,
-        labels={"value": "Age at death (years)", "count": "Simulations"}
+        labels={"value": "Age at death (years)", "Count": "Simulations"}
     )
     fig_life.update_traces(xbins=dict(size=0.5))
 
@@ -385,7 +420,8 @@ fig_life.update_xaxes(range=[int(age), None])
 fig_life.update_layout(
     title=dict(text=life_title, x=0, xanchor="left", font=dict(size=16, color="#444")),
     margin=dict(t=40, r=0, l=0, b=0),
-    height=420
+    height=420,
+    showlegend=False
 )
 
 # --- Right chart data (scatter/heatmap) ---
@@ -429,7 +465,7 @@ else:
         labels={"Life": "Age at death (years)", "NetWorth": "Net worth at death ($MM)"}
     )
 fig_nw.update_xaxes(range=[int(age), None])
-title_text = "Net worth vs projected life — density" if view == "Heatmap" else "Net worth vs projected life (per draw)"
+title_text = "Net Worth vs Predicted Lifespan" if view == "Heatmap" else "Net Worth vs Predicted Lifespan"
 fig_nw.update_layout(title=dict(text=title_text, x=0, xanchor="left", font=dict(size=16, color="#444")),
                      margin=dict(t=40, r=0, l=0, b=0), height=420)
 
@@ -444,10 +480,11 @@ with col_r:
 
 # Years-added chart: Excel-match mode by default with options
 mode = st.selectbox(
-    "Years-added chart",
-    ["Your Health Habits", "Habits & Treatments (if alive)", "Future Treatments (if alive)"],
+    "Added Years Breakdown",
+    ["From Health Habits", "From Habits + Treatments (survivors only)", "From Future Treatments (survivors only)"],
     index=0,
-    help="Excel's dashboard chart shows interventions only. ...Alive-weighted' tech counts only when a draw is alive that year"
+    help="Shows how different health habits and treatments contribute to extra years of life. Values " \
+    "are weighted only for people still alive in each simulated year."
 )
 
 yrs_int = out["yrs_added_interventions"]                           # (T,)
@@ -462,34 +499,43 @@ if le_series is None:
 alive_mask = (out["bio_age"] < le_series[None, :]).astype(float)  # (D, T)
 exp_tech_by_age = (out["tech_years_by_age"] * alive_mask).mean(axis=0)
 
-if mode.startswith("Your Health Habits"):
+if mode.startswith("From Health Habits"):
     y = yrs_int
-elif mode.startswith("Habits & Treatments (if alive)"):
+elif mode.startswith("From Habits + Treatments (survivors only)"):
     y = yrs_int + exp_tech_by_age
 else:  # Tech only
     y = exp_tech_by_age
 
 fig_yrs = px.area(x=out["chrono_age"], y=y,
-                  labels={"x": "Age", "y": "Expected Years Added"},
+                  labels={"x": "Age", "y": "Years Added by Age"},
                   title=mode)
 st.plotly_chart(fig_yrs, use_container_width=True)
 
 # Optional diagnostic
-with st.expander("Average Biological Age vs Life Expectancy"):
+with st.expander("Health vs Life Expectancy", expanded=False):
     mean_bio = out["bio_age"].mean(axis=0)        # (T,)
-    le_series = out.get("threshold_series")       # (T,)
+
+    le_series = out.get("threshold_series")
     if le_series is None:
         le_series = out.get("le_threshold_series")
 
+    # sanity: make sure lengths match your age axis
+    assert len(le_series) == len(out["chrono_age"]), "LE series length mismatch"
+
     df = pd.DataFrame({
         "Age": out["chrono_age"],
-        "Biological age (mean)": mean_bio,
-        "LE threshold": le_series,                # already (T,) – no .mean(axis=0)
+        "Biological Age (mean)": mean_bio,
+        "Life Expectancy": le_series,
     })
+
     fig_diag = px.line(
-        df, x="Age", y=["Biological age (mean)", "LE threshold"],
-        title="Biological Age vs Average Life Expectancy"
+        df,
+        x="Age",
+        y=["Biological Age (mean)", "Life Expectancy"],
+        title="Biological Age vs Societal Life Expectancy",
+        labels={"Age": "Age (years)", "value": "Years", "variable": ""},
     )
+    fig_diag.update_layout(legend_title_text="")
     st.plotly_chart(fig_diag, use_container_width=True)
 
 # Finance diagnostics
