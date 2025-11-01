@@ -37,6 +37,22 @@ def pct_slider(label, *, min_pct=0.0, max_pct=100.0, value_pct=0.0,
     v = (st.sidebar.slider(**args) if sidebar else st.slider(**args))
     return v / 100.0  # normalize to 0–1 for the engine
 
+# ---------- Axis helpers ----------
+def _axis_from_data(arr, q_lo=0.5, q_hi=99.5, pad_frac=0.02, min_span=2.0):
+    """
+    Build tight (lo, hi) axis limits from data quantiles, with a small pad
+    and a minimum span so tiny samples still render sensibly.
+    """
+    import numpy as np
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return (0.0, 1.0)
+    lo, hi = np.nanpercentile(a, [q_lo, q_hi])
+    span = max(min_span, hi - lo)
+    pad = max(0.5, pad_frac * span)
+    return float(lo - pad), float(hi + pad)
+
 # ---------- Hazard-dose helper ----------
 def _apply_dose_log(hr_full: float, a: float) -> float:
     """Scale a hazard ratio by exposure fraction a in [0,1] on the log scale."""
@@ -416,7 +432,8 @@ else:
     )
     fig_life.update_traces(xbins=dict(size=0.5))
 
-fig_life.update_xaxes(range=[int(age), None])
+x_lo, x_hi = _axis_from_data(life_data)
+fig_life.update_xaxes(range=[x_lo, x_hi])
 fig_life.update_layout(
     title=dict(text=life_title, x=0, xanchor="left", font=dict(size=16, color="#444")),
     margin=dict(t=40, r=0, l=0, b=0),
@@ -464,7 +481,10 @@ else:
         title="Simulated Wealth Outcomes by Lifespan",
         labels={"Life": "Age at death (years)", "NetWorth": "Net worth at death ($MM)"}
     )
-fig_nw.update_xaxes(range=[int(age), None])
+x_lo2, x_hi2 = _axis_from_data(df_nw["Life"])
+y_lo2, y_hi2 = _axis_from_data(df_nw["NetWorth"], pad_frac=0.04, min_span=0.2)
+fig_nw.update_xaxes(range=[x_lo2, x_hi2])
+fig_nw.update_yaxes(range=[y_lo2, y_hi2])
 title_text = "Net Worth vs Predicted Lifespan" if view == "Heatmap" else "Net Worth vs Predicted Lifespan"
 fig_nw.update_layout(title=dict(text=title_text, x=0, xanchor="left", font=dict(size=16, color="#444")),
                      margin=dict(t=40, r=0, l=0, b=0), height=420)
