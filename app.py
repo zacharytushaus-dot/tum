@@ -100,7 +100,7 @@ preset = st.sidebar.selectbox(
     "Preset Habits",
     ["None", "Core Routine", "Active Routine", "Longevity Protocol", "Bad Idea Mode"],
     index=0,
-    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after."
+    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after"
 )
 
 # Default risk multipliers (HR×adherence at 100%)
@@ -124,35 +124,55 @@ PRESET_TOGGLES = {
     "Bad Idea Mode":      {"Consistent Sleep": False,  "Frequent Exercise": False,  "Mediterranean Diet": False,  "Meditation": False,  "Red-Light Therapy": False, "Frequent Sauna": False, "Heavy Smoking": True, "Heavy Drinking": True}
 }
 
+# ---------------- 2) Your Health Habits ----------------
 st.sidebar.header("2) Your Health Habits")
+
+# Split habits by effect
+BENEFICIAL = [n for n, hr in BASE_RISK_MULT.items() if hr < 1.0]
+HARMFUL    = [n for n, hr in BASE_RISK_MULT.items() if hr > 1.0]
+
 toggles = {}
-for name, default_on in PRESET_TOGGLES[preset].items():
-    toggles[name] = st.sidebar.checkbox(name, value=default_on)
 
-adherence = pct_slider("Adherence to your habits",
-                       value_pct=75.0, step_pct=5.0, digits=0,)
-st.sidebar.caption("How likely you are to commit to your habits")
+# ---- Helpful habits ----
+st.sidebar.subheader("Helpful habits")
+for name in BENEFICIAL:
+    default_on = PRESET_TOGGLES[preset].get(name, False)
+    toggles[name] = st.sidebar.checkbox(name, value=default_on, key=f"help_{name}")
 
-# --- Harmful habit intensity (only shows if the toggle is on) ---
-st.sidebar.subheader("Harmful habit intensity")
+adherence = pct_slider(
+    "Adherence to helpful habits",
+    value_pct=75.0, step_pct=5.0, digits=0,
+    help="How likely you are to commit to your habits"
+)
+# (No caption beneath the slider by design)
 
-# Defaults so variables exist even if sliders do not render
-smoke_exposure = 0.0
-drink_exposure = 0.0
+# ---- Harmful habits ----
+st.sidebar.subheader("Harmful habits")
 
-if toggles.get("Heavy Smoking", False):
-    smoke_exposure = pct_slider(
-        "Smoking Intensity",
-        value_pct=100.0, step_pct=10.0, digits=0,
-        help="Percent of time you meet your 'heavy smoking' definition."
+def harmful_block(label: str, slider_label: str, key_prefix: str):
+    """Full-width checkbox on one line; if enabled, show its slider directly below."""
+    on = st.sidebar.checkbox(
+        label,
+        value=PRESET_TOGGLES[preset].get(label, False),
+        key=f"{key_prefix}_on"
     )
+    intensity = 0.0
+    if on:
+        intensity = pct_slider(
+            f"{slider_label}",
+            value_pct=100.0, step_pct=10.0, digits=0,
+            key=f"{key_prefix}_intensity",
+            help="Percent of time you match your selected level"
+        )
+    return on, intensity
 
-if toggles.get("Heavy Drinking", False):
-    drink_exposure = pct_slider(
-        "Drinking Intensity",
-        value_pct=100.0, step_pct=10.0, digits=0,
-        help="Percent of time you meet your 'heavy drinking' definition."
-    )
+# Each harmful toggle sits on one line; slider appears directly underneath
+smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity",  "smoke")
+drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity", "drink")
+
+# Keep these in toggles for the rest of the app
+toggles["Heavy Smoking"]  = smoke_on
+toggles["Heavy Drinking"] = drink_on
 
 # --- Weight status (mutually exclusive) ---
 st.sidebar.subheader("Weight status")
@@ -163,7 +183,7 @@ weight_label = st.sidebar.selectbox(
      "High Body Weight (BMI 30-34.9)",
      "Very High Body Weight (BMI ≥35)"],
     index=0,
-    help="If BMI doesn't fit you (e.g., very muscular), use waist instead: central obesity = waist-to-height ≥ 0.6 or waist ≥ 102 cm (men) / 88 cm (women)."
+    help="If BMI doesn't fit you (e.g., very muscular), use waist instead: central obesity = waist-to-height ≥ 0.6 or waist ≥ 102 cm (men) / 88 cm (women)"
 )
 
 WEIGHT_HR = {
@@ -302,7 +322,11 @@ tier3 = tier_inputs("Tier 3", p0=0.0012,g_pp=0.0015, cap=0.10, cost=2_400_000, y
 
 # ------------------ Sidebar: longevity params ------------------
 st.sidebar.header("5) Longevity Parameters")
-lambda_plateau = st.sidebar.number_input("Late-age Risk Plateau λ", min_value=0.0, max_value=5.0, value=0.6, step=0.05)
+lambda_plateau = st.sidebar.number_input(
+    "Late-age Risk Plateau λ",
+    min_value=0.0, max_value=5.0, value=0.6, step=0.05,
+    help="Only affects very late life. Sets a minimum death risk after the frontier age; larger λ increases it"
+)
 drift_days = st.sidebar.number_input("Frontier Age Drift (days per year)", min_value=0.0, max_value=200.0, value=15.0, step=1.0)
 le_improve = pct_slider("Life Expectancy Growth", min_pct=0.0, max_pct=2.0,
                         value_pct=0.2, step_pct=0.1, digits=2, period="per year")
@@ -379,7 +403,7 @@ with col2:
     st.metric(
         "Years from habits (expected)",
         f"{yrs_from_habits:.1f} years",
-        help="Expected years added from your current health habits, integrated over your lifetime."
+        help="Expected years added from your current health habits, integrated over your lifetime"
     )
 
 with col3:
@@ -391,7 +415,7 @@ with col3:
     st.metric(
         "Years from treatments (expected, if bought)",
         f"{yrs_from_tech:.1f} years",
-        help="Alive-weighted expected years from Tier 1-3 purchases, gated by your budget and arrival probabilities."
+        help="Alive-weighted expected years from Tier 1-3 purchases, gated by your budget and arrival probabilities"
     )
     
 # ================== Lifespan + Wealth controls (row 1) ==================
@@ -402,9 +426,8 @@ with ctrl_l:
         "How should we simulate lifespans?",
         ["Random chance each year", "Predicted Lifespan"],
         index=1,  # default to deterministic
-        help=("Random chance each year: we roll the dice on survival each simulated year based on your risk profile. "
-              "Predicted Lifespan: we assume death the moment your biological age meets the exceeds society's "
-              "life expectancy for that calendar year.")
+        help=("Random chance means we roll survival each year based on your risk profile, while"
+        " predicted lifespan assumes death once your biological age passes the population life expectancy")
     )
 
 with ctrl_r:
@@ -504,7 +527,7 @@ mode = st.selectbox(
     ["From Health Habits", "From Habits + Treatments (survivors only)", "From Future Treatments (survivors only)"],
     index=0,
     help="Shows how different health habits and treatments contribute to extra years of life. Values " \
-    "are weighted only for people still alive in each simulated year."
+    "are weighted only for people still alive in each simulated year"
 )
 
 yrs_int = out["yrs_added_interventions"]                           # (T,)
@@ -579,7 +602,7 @@ with cA:
         ["Both (overlay)", "With treatments", "Without treatments"],
         index=0, horizontal=True,
         help="With = includes costs when they arrive and extra years gained. "
-             "Without = identical inputs but no future treatments."
+             "Without = identical inputs but no future treatments"
     )
 with cB:
     avg = st.radio("Average", ["Mean", "Median"], index=0, horizontal=True)
@@ -588,7 +611,7 @@ with cC:
 with cD:
     alive_weighted = st.checkbox(
         "Alive-weighted", value=True,
-        help="Average only across simulations still alive at each age."
+        help="Average only across simulations still alive at each age"
     )
 
 # --- Data we need from the engine ---
@@ -689,7 +712,7 @@ st.plotly_chart(fig_bal, use_container_width=True)
 # --- Chart B: Annual cash flows (optional) ---
 show_cf = st.checkbox(
     "Show annual cash flows", value=False,
-    help="Cash into the portfolio vs expected treatment spend (excludes market returns)."
+    help="Cash into the portfolio vs expected treatment spend (excludes market returns)"
 )
 if show_cf:
     # Dollars (not millions) for cash flows
