@@ -133,11 +133,32 @@ HARMFUL    = [n for n, hr in BASE_RISK_MULT.items() if hr > 1.0]
 
 toggles = {}
 
+# --- Apply preset to widget state when preset changes ---
+defaults = PRESET_TOGGLES[preset]
+
+if st.session_state.get("_last_preset") != preset:
+    # Helpful habits
+    for name in [n for n, hr in BASE_RISK_MULT.items() if hr < 1.0]:
+        st.session_state[f"help_{name}"] = bool(defaults.get(name, False))
+
+    # Harmful habits
+    st.session_state["smoke_on"]  = bool(defaults.get("Heavy Smoking", False))
+    st.session_state["drink_on"]  = bool(defaults.get("Heavy Drinking", False))
+
+    # Intensity sliders default to 100% when on, 0% when off
+    st.session_state.setdefault("smoke_intensity", 100.0)
+    st.session_state.setdefault("drink_intensity", 100.0)
+    if not st.session_state["smoke_on"]:
+        st.session_state["smoke_intensity"] = 0.0
+    if not st.session_state["drink_on"]:
+        st.session_state["drink_intensity"] = 0.0
+
+    st.session_state["_last_preset"] = preset
+
 # ---- Helpful habits ----
 st.sidebar.subheader("Helpful habits")
 for name in BENEFICIAL:
-    default_on = PRESET_TOGGLES[preset].get(name, False)
-    toggles[name] = st.sidebar.checkbox(name, value=default_on, key=f"help_{name}")
+    toggles[name] = st.sidebar.checkbox(name, key=f"help_{name}")
 
 adherence = pct_slider(
     "Adherence to helpful habits",
@@ -150,27 +171,18 @@ adherence = pct_slider(
 st.sidebar.subheader("Harmful habits")
 
 def harmful_block(label: str, slider_label: str, key_prefix: str):
-    """Full-width checkbox on one line; if enabled, show its slider directly below."""
-    on = st.sidebar.checkbox(
-        label,
-        value=PRESET_TOGGLES[preset].get(label, False),
-        key=f"{key_prefix}_on"
-    )
+    on = st.sidebar.checkbox(label, key=f"{key_prefix}_on")  # no value=
     intensity = 0.0
     if on:
         intensity = pct_slider(
-            f"{slider_label}",
-            value_pct=100.0, step_pct=10.0, digits=0,
-            key=f"{key_prefix}_intensity",
+            slider_label, value_pct=st.session_state.get(f"{key_prefix}_intensity", 100.0),
+            step_pct=10.0, digits=0, key=f"{key_prefix}_intensity",
             help="Percent of time you match your selected level"
         )
     return on, intensity
 
-# Each harmful toggle sits on one line; slider appears directly underneath
-smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity",  "smoke")
-drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity", "drink")
-
-# Keep these in toggles for the rest of the app
+smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity (%)",  "smoke")
+drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity (%)", "drink")
 toggles["Heavy Smoking"]  = smoke_on
 toggles["Heavy Drinking"] = drink_on
 
