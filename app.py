@@ -59,6 +59,30 @@ def _apply_dose_log(hr_full: float, a: float) -> float:
     a = max(0.0, min(1.0, float(a)))
     return float(hr_full) ** a
 
+def _scale_hr(base_hr: float, adherence: float, *, mode: str = "log", curvature: float = 1.0) -> float:
+    """
+    Scale a base HR by adherence in [0,1].
+
+    mode="log"     -> base_hr ** adherence  (actuarial symmetry; time-mixing invariant)
+    mode="linear"  -> 1 - adherence*(1 - base_hr)  (legacy partial credit)
+
+    curvature only applies in log mode: adherence_effect = adherence**curvature
+    curvature > 1 softens mid-adherence; curvature < 1 strengthens it.
+    """
+    a = max(0.0, min(1.0, float(adherence)))
+    if mode == "linear":
+        return 1.0 - a * (1.0 - float(base_hr))
+    eff = a ** max(0.1, float(curvature))
+    return float(base_hr) ** eff
+
+def _combine_multipliers(mult_dict: dict[str, float]) -> float:
+    import math
+    total_log = 0.0
+    for v in mult_dict.values():
+        v = max(1e-9, float(v))
+        total_log += math.log(v)
+    return math.exp(total_log)
+
 def pct_number(label, *, value_pct=0.0, step_pct=0.1, key=None, help=None,
                sidebar=True, period=None, min_pct=0.0, max_pct=100.0,
                digits=None, fmt=None):
@@ -91,25 +115,19 @@ if "results" not in st.session_state:
 st.title("Time Utility Model")
 
 # ------------------ Sidebar: profile & lifestyle types ------------------
+
 st.sidebar.header("1) Your Demographics")
 
-age = st.sidebar.number_input("Your Age", min_value=18, max_value=95, value=21, step=1)
+age = st.sidebar.number_input("Age", min_value=18, max_value=95, value=21, step=1)
 sex = st.sidebar.selectbox("Sex", ["Male", "Female"])
-
-preset = st.sidebar.selectbox(
-    "Preset Habits",
-    ["None", "Core Routine", "Active Routine", "Longevity Protocol", "Bad Idea Mode"],
-    index=0,
-    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after"
-)
 
 # Default risk multipliers (HR×adherence at 100%)
 BASE_RISK_MULT = {
     "Consistent Sleep": 0.88,
     "Frequent Exercise": 0.68,
-    "Frequent Sauna": 0.90, # ≥3–4 sessions/week; consider 0.75–0.80 for 4–7/wk
     "Mediterranean Diet": 0.77,
     "Meditation": 0.93,
+    "Frequent Sauna": 0.90, # ≥3–4 sessions/week; consider 0.75–0.80 for 4–7/wk
     "Red-Light Therapy": 0.98,
     "Heavy Smoking": 2.5, # harmful, editable in UI later if we want
     "Heavy Drinking": 1.25, # 3-4 drinks/day; use 1.35 for "very heavy"
@@ -127,62 +145,67 @@ PRESET_TOGGLES = {
 # ---------------- 2) Your Health Habits ----------------
 st.sidebar.header("2) Your Health Habits")
 
+# Hazard scaling type (applies to all habits)
+scale_choice = st.sidebar.selectbox(
+    "Risk Scaling Method",
+    ["Log (recommended)", "Linear"],
+    index=0,
+    key="hazard_scale_mode",
+    help="Chooses how health effects scale. Logarithmic compounds over time; Linear applies flat, partial-credit changes"
+)
+scaling_mode = "log" if "log" in scale_choice.lower() else "linear"
+benefit_curvature = 1.0  # fixed; not exposed
+
+preset = st.sidebar.selectbox(
+    "Preset Habits",
+    ["None", "Core Routine", "Active Routine", "Longevity Protocol", "Bad Idea Mode"],
+    index=0,
+    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after"
+)
+
 # Split habits by effect
 BENEFICIAL = [n for n, hr in BASE_RISK_MULT.items() if hr < 1.0]
 HARMFUL    = [n for n, hr in BASE_RISK_MULT.items() if hr > 1.0]
 
 toggles = {}
 
-# --- Apply preset to widget state when preset changes ---
-defaults = PRESET_TOGGLES[preset]
-
-if st.session_state.get("_last_preset") != preset:
-    # Helpful habits
-    for name in [n for n, hr in BASE_RISK_MULT.items() if hr < 1.0]:
-        st.session_state[f"help_{name}"] = bool(defaults.get(name, False))
-
-    # Harmful habits
-    st.session_state["smoke_on"]  = bool(defaults.get("Heavy Smoking", False))
-    st.session_state["drink_on"]  = bool(defaults.get("Heavy Drinking", False))
-
-    # Intensity sliders default to 100% when on, 0% when off
-    st.session_state.setdefault("smoke_intensity", 100.0)
-    st.session_state.setdefault("drink_intensity", 100.0)
-    if not st.session_state["smoke_on"]:
-        st.session_state["smoke_intensity"] = 0.0
-    if not st.session_state["drink_on"]:
-        st.session_state["drink_intensity"] = 0.0
-
-    st.session_state["_last_preset"] = preset
-
 # ---- Helpful habits ----
 st.sidebar.subheader("Helpful habits")
 for name in BENEFICIAL:
-    toggles[name] = st.sidebar.checkbox(name, key=f"help_{name}")
+    default_on = PRESET_TOGGLES[preset].get(name, False)
+    toggles[name] = st.sidebar.checkbox(name, value=default_on, key=f"help_{name}")
 
 adherence = pct_slider(
     "Adherence to helpful habits",
     value_pct=75.0, step_pct=5.0, digits=0,
     help="How likely you are to commit to your habits"
 )
-# (No caption beneath the slider by design)
 
 # ---- Harmful habits ----
 st.sidebar.subheader("Harmful habits")
 
 def harmful_block(label: str, slider_label: str, key_prefix: str):
-    on = st.sidebar.checkbox(label, key=f"{key_prefix}_on")  # no value=
+    """Full-width checkbox on one line; if enabled, show its slider directly below."""
+    on = st.sidebar.checkbox(
+        label,
+        value=PRESET_TOGGLES[preset].get(label, False),
+        key=f"{key_prefix}_on"
+    )
     intensity = 0.0
     if on:
         intensity = pct_slider(
-            slider_label, value_pct=st.session_state.get(f"{key_prefix}_intensity", 100.0),
-            step_pct=10.0, digits=0, key=f"{key_prefix}_intensity",
-            help="Percent of time you match your selected level"
+            f"{slider_label}",
+            value_pct=100.0, step_pct=10.0, digits=0,
+            key=f"{key_prefix}_intensity",
+            help="How frequently or heavily you do this habit"
         )
     return on, intensity
 
-smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity (%)",  "smoke")
-drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity (%)", "drink")
+# Each harmful toggle sits on one line; slider appears directly underneath
+smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity",  "smoke")
+drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity", "drink")
+
+# Keep these in toggles for the rest of the app
 toggles["Heavy Smoking"]  = smoke_on
 toggles["Heavy Drinking"] = drink_on
 
@@ -230,8 +253,8 @@ for name, base in BASE_RISK_MULT.items():
     if not on or base == 1.0:
         m = 1.0
     elif base < 1.0:
-        # Protective habit → scale by adherence (80% adherence = 80% of the benefit)
-        m = 1.0 - adherence * (1.0 - base)
+        # inside the multipliers loop, helpful branch
+        m = _scale_hr(base, adherence, mode=scaling_mode)
     else:
         # Harmful exposure → scale by exposure on the log-hazard scale
         if key == "smoker":
@@ -239,8 +262,8 @@ for name, base in BASE_RISK_MULT.items():
         elif key == "heavyalcohol":
             a = drink_exposure
         else:
-            a = 1.0  # fallback for any future harmfuls lacking a slider
-        m = _apply_dose_log(base, a)
+            a = 1.0
+        m = _scale_hr(base, a, mode=scaling_mode)
 
     lifestyle_HRs[key] = float(m)
 
@@ -349,7 +372,66 @@ st.sidebar.header("6) Simulation")
 draws = st.sidebar.slider("Simulation Runs", 1000, 50000, 5000, step=1000)
 seed = st.sidebar.number_input("Random Seed (reproducible)", min_value=0, max_value=1_000_000, value=49, step=1)
 
-if st.sidebar.button("Run Simulation", type="primary"):
+import hashlib, json
+
+def _hash_inputs():
+    cfg = dict(
+        age=int(age), sex=str(sex),
+        scaling_mode=scaling_mode,
+        preset=str(preset),
+        toggles=toggles,
+        adherence=float(adherence),
+        smoke_on=bool(smoke_on), smoke_exposure=float(smoke_exposure),
+        drink_on=bool(drink_on), drink_exposure=float(drink_exposure),
+        weight_label=str(weight_label),
+        lambdaP=float(lambda_plateau), drift=float(drift_days),
+        le_trend=float(le_improve), frontier=float(max_age_today),
+        ret=float(ret), di0=float(di0), hc=float(hc_infl),
+        tier1=dict(cost=tier1.cost_today, years=tier1.years_gain, p=tier1.base_prob,
+                   g=tier1.growth_per_year, cap=tier1.cap_prob),
+        tier2=dict(cost=tier2.cost_today, years=tier2.years_gain, p=tier2.base_prob,
+                   g=tier2.growth_per_year, cap=tier2.cap_prob),
+        tier3=dict(cost=tier3.cost_today, years=tier3.years_gain, p=tier3.base_prob,
+                   g=tier3.growth_per_year, cap=tier3.cap_prob),
+    )
+    s = json.dumps(cfg, sort_keys=True, default=float)
+    return hashlib.sha256(s.encode()).hexdigest()
+
+new_sig = _hash_inputs()
+if "input_sig" not in st.session_state:
+    st.session_state.input_sig = new_sig
+elif st.session_state.input_sig != new_sig:
+    # inputs changed since last run → clear stale results
+    st.session_state.input_sig = new_sig
+    st.session_state.results = None
+
+# Sidebar Run Simulation styling: full width, custom colors, bold label
+st.markdown("""
+<style>
+/* Scope to sidebar so main-pane buttons stay default */
+[data-testid="stSidebar"] .stButton > button {
+  width: 100%;
+  background-color: #cddae9 !important;  /* fill */
+  color: #09427d !important;             /* label text */
+  border: 1px solid #cddae9 !important;
+  border-radius: 12px !important;
+}
+
+/* hover + active states */
+[data-testid="stSidebar"] .stButton > button:hover {
+  background-color: #dbe6f2 !important;
+  border-color: #dbe6f2 !important;
+  color: #072f59 !important;
+}
+[data-testid="stSidebar"] .stButton > button:active {
+  background-color: #bfd0e3 !important;
+  border-color: #bfd0e3 !important;
+  color: #072f59 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+if st.sidebar.button("Run Simulation", type="primary", use_container_width=True):
     inputs = Inputs(
         start_age=int(age),
         sex=sex,
