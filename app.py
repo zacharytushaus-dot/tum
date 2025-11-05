@@ -280,11 +280,33 @@ scale_choice = st.sidebar.selectbox(
 scaling_mode = "log" if "log" in scale_choice.lower() else "linear"
 benefit_curvature = 1.0  # fixed; not exposed
 
+def _apply_preset():
+    p = st.session_state["preset"]  # new preset value
+
+    # Helpful: set each checkbox and seed its adherence slider (percent units)
+    for name in BENEFICIAL:
+        key = CANON[name]  # e.g., "sleep", "exercise"
+        on = bool(PRESET_TOGGLES[p].get(name, False))
+        st.session_state[f"help_{key}_on"] = on
+        # seed per-habit slider to 75% (or keep last if you prefer)
+        st.session_state[f"help_{key}_adh"] = 75.0 if on else 0.0
+
+    # Harmful: set toggles and exposures (sliders expect % values)
+    st.session_state["smoke_on"] = bool(PRESET_TOGGLES[p].get("Heavy Smoking", False))
+    st.session_state["drink_on"] = bool(PRESET_TOGGLES[p].get("Heavy Drinking", False))
+    st.session_state["smoke_exposure"] = 100.0 if st.session_state["smoke_on"] else 0.0
+    st.session_state["drink_exposure"] = 100.0 if st.session_state["drink_on"] else 0.0
+
+    # Clear previous results so “Run Simulation” isn’t using stale outputs
+    st.session_state.results = None
+
 preset = st.sidebar.selectbox(
     "Preset Habits",
     ["None", "Core Routine", "Active Routine", "Longevity Protocol", "Bad Idea Mode"],
     index=0,
-    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after"
+    key="preset",
+    help="Optional: choose a plan to auto-fill your health habits below. You can edit them after",
+    on_change=_apply_preset
 )
 
 # Split habits by effect
@@ -612,7 +634,12 @@ if out is None:
     st.info("Describe yourself on the left, then click **Run Simulation**")
     st.stop()  # ← do not execute the rest of the page until results exist
 else:
+    # Title + caption for the 2×3 overview grid
+    st.subheader("Results Overview")
+    st.caption("How long you're expected to live, what you'll be worth, and where your extra years come from")
+
     col1, col2, col3 = st.columns(3)
+
     median_life = float(np.median(out["projected_life"]))
     p5, p95 = np.percentile(out["projected_life"], [5,95])
     median_net = float(np.median(out["net_worth"]))
@@ -658,7 +685,142 @@ with col3:
         help="Alive-weighted expected years from Tier 1-3 purchases, gated by your budget and arrival probabilities"
     )
 
+# ------------------ Health Spending Outcomes ------------------
+
+# tiny vertical spacer between the two metric groups
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+st.subheader("Spending Outcomes")
+st.caption("What your health purchases cost, how many years they buy, and what's left for your estate")
+
+# 1) Pull arrays safely
+age_grid      = np.asarray(out["chrono_age"], dtype=float)                  # (T,)
+bal_with      = np.asarray(out["balance_path"], dtype=float)                # (D, T) in $
+bal_without   = np.asarray(out["balance_no_tech_path"], dtype=float)        # (D, T) in $
+path_with     = bal_with / 1e6                                              # $MM for plotting
+path_without  = bal_without / 1e6
+
+def _first_present(d, *keys):
+    for k in keys:
+        v = d.get(k, None)
+        if v is not None:
+            return v
+    return None
+
+thr = _first_present(out, "threshold_series", "le_threshold_series")
+if thr is None:
+    raise KeyError("Missing threshold series: expected 'threshold_series' or 'le_threshold_series'.")
+thr = np.asarray(thr, dtype=float).ravel()
+
+bio_age           = np.asarray(out["bio_age"], dtype=float)                 # (D, T)
+tech_years_by_age = np.asarray(out["tech_years_by_age"], dtype=float)       # (D, T)
+
+# 2) Alive masks (baseline = WITHOUT; treatments reduce biological age)
+cum_tech    = np.cumsum(tech_years_by_age, axis=1)
+bio_with    = np.maximum(0.0, bio_age - cum_tech)                            # WITH treatments
+alive_with  = (bio_with  < thr[None, :])
+alive_without = (bio_age < thr[None, :])                                     # WITHOUT = baseline
+
+# 3) Scenario-specific median death ages (first age with <=50% alive)
+def _median_death_age(alive_mask):
+    surv = alive_mask.mean(axis=0)  # proportion alive by age
+    idx  = np.where(surv <= 0.5)[0]
+    return float(age_grid[idx[0]]) if idx.size else float(age_grid[-1])
+
+med_age_with    = _median_death_age(alive_with)
+med_age_without = _median_death_age(alive_without)
+
+mask_with    = (age_grid <= med_age_with)
+mask_without = (age_grid <= med_age_without)
+
+# 4) Alive-weighted medians for portfolio paths (center lines)
+def _median_alive(path, alive_mask):
+    D, T = path.shape
+    med = np.full(T, np.nan)
+    for t in range(T):
+        vals = path[alive_mask[:, t], t]
+        if vals.size:
+            med[t] = np.median(vals)
+    return med
+
+m_with    = _median_alive(path_with,    alive_with)
+m_without = _median_alive(path_without, alive_without)
+
+# ----- KPI foundations: compute per-draw totals up to WITH median age -----
+# window mask
+m = mask_with  # ages <= WITH median death age
+
+# Safety arrays
+tech_spend = out.get("tech_costs_by_age")  # (D, T) dollars
+tech_spend = np.asarray(tech_spend, dtype=float) if tech_spend is not None else None
+tyba = np.asarray(out["tech_years_by_age"], dtype=float)                  # (D, T)
+alive_w = alive_with                                                       # (D, T)
+
+# Per-draw totals (undiscounted) to WITH median age
+if tech_spend is None:
+    spend_by_draw = np.zeros(bio_age.shape[0], dtype=float)
+else:
+    spend_by_draw = (tech_spend[:, m] * alive_w[:, m]).sum(axis=1)        # $ per draw
+
+yrs_by_draw = (tyba[:, m] * alive_w[:, m]).sum(axis=1)                    # yrs per draw
+
+# Typical (median) and expected (mean) totals
+typ_cost_total   = float(np.median(spend_by_draw))                         # headline
+exp_cost_total   = float(spend_by_draw.mean())                             # optional in caption
+
+# Present value (so the dollars mean something)
+# Use user's portfolio return if available, else 3% real
+_r = float(locals().get("ret", 0.03))
+years = age_grid[m] - age_grid[m][0]
+df = (1.0 / (1.0 + _r)) ** years
+if tech_spend is None:
+    pv_cost_median = 0.0
+else:
+    pv_by_draw = (tech_spend[:, m] * alive_w[:, m] * df[None, :]).sum(axis=1)
+    pv_cost_median = float(np.median(pv_by_draw))
+
+# ROI as a distribution, then report median
+roi_draw = np.full_like(yrs_by_draw, np.nan, dtype=float)
+nz = spend_by_draw > 0
+roi_draw[nz] = yrs_by_draw[nz] / (spend_by_draw[nz] / 100000.0)
+roi_median = float(np.nanmedian(roi_draw))                                 # headline ROI
+
+# ----- Bequest at death (medians by scenario, then delta) -----
+def _terminal_wealth_at_death(bal, alive_mask):
+    D, T = bal.shape
+    tw = np.zeros(D, dtype=float)
+    for d in range(D):
+        idx = np.where(alive_mask[d])[0]
+        t = idx[-1] if idx.size else 0
+        tw[d] = bal[d, t]
+    return tw
+
+tw_with    = _terminal_wealth_at_death(bal_with,    alive_with)
+tw_without = _terminal_wealth_at_death(bal_without, alive_without)
+
+tw_with_med    = float(np.median(tw_with))
+tw_without_med = float(np.median(tw_without))
+bequest_delta_med = tw_with_med - tw_without_med
+
+# 6) KPI row (1 x 3): Spend | ROI | Bequest
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.metric("Expected treatment costs", f"${typ_cost_total:,.0f}")
+
+with c2:
+    st.metric("Years gained for every $100k", f"{roi_median:.2f} yrs")
+
+def _fmt_signed_currency(x):
+    sign = "+" if x > 0 else ""  # minus sign will come from format itself
+    return f"{sign}${abs(x):,.0f}" if x < 0 else f"{sign}${x:,.0f}"
+
+with c3:
+    st.metric("Money you leave behind", _fmt_signed_currency(bequest_delta_med))
+
 # ---------- Impact analysis (local counterfactual) ----------
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
 with st.expander("What helped or hurt most?", expanded=False):
     st.caption("We re-run your profile once per factor, setting that factor to **baseline (risk ×1.00)**, and report how your " \
     "**median lifespan** would change. “Risk ×1.10” means 10% higher yearly death risk; “×0.90” means 10% lower.")
@@ -752,6 +914,8 @@ with st.expander("What helped or hurt most?", expanded=False):
             )
     
 # ================== Lifespan + Wealth controls (row 1) ==================
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
 ctrl_l, ctrl_r = st.columns(2)
 
 with ctrl_l:
@@ -854,6 +1018,8 @@ with col_l:
 with col_r:
     st.plotly_chart(fig_nw, use_container_width=True)
 
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
 # Years-added chart: Excel-match mode by default with options
 mode = st.selectbox(
     "Added Years Breakdown",
@@ -888,6 +1054,8 @@ fig_yrs = px.area(x=out["chrono_age"], y=y,
 st.plotly_chart(fig_yrs, use_container_width=True)
 
 # Optional diagnostic
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
 with st.expander("Health vs Life Expectancy", expanded=False):
     mean_bio = out["bio_age"].mean(axis=0)        # (T,)
 
@@ -915,6 +1083,8 @@ with st.expander("Health vs Life Expectancy", expanded=False):
     st.plotly_chart(fig_diag, use_container_width=True)
 
 # Finance diagnostics
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
 with st.expander("Personal Finances, First 20 Years"):
     df_fin = pd.DataFrame({
         "Age": out["chrono_age"],
@@ -924,152 +1094,35 @@ with st.expander("Personal Finances, First 20 Years"):
     })
     st.dataframe(df_fin.head(20), use_container_width=True, height=480)
 
-# ------------------ Investments over time ------------------
-st.subheader("Investments over time")
+# 7) Portfolio overlay (optional, after KPIs). Trim at each scenario's own median age.
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-# --- Controls row ---
-cA, cB, cC, cD = st.columns([2, 1, 1, 1])
-with cA:
-    compare = st.radio(
-        "Include future treatments",
-        ["Both (overlay)", "With treatments", "Without treatments"],
-        index=0, horizontal=True,
-        help="With = includes costs when they arrive and extra years gained. "
-             "Without = identical inputs but no future treatments"
-    )
-with cB:
-    avg = st.radio("Average", ["Mean", "Median"], index=0, horizontal=True)
-with cC:
-    band_opt = st.selectbox("Uncertainty band", ["None", "50%", "80%", "90%"], index=3)
-with cD:
-    alive_weighted = st.checkbox(
-        "Alive-weighted", value=True,
-        help="Average only across simulations still alive at each age"
-    )
-
-# --- Data we need from the engine ---
-age_grid = out["chrono_age"]                           # (T,)
-path_with = out.get("balance_path", None)              # (D, T) dollars
-path_without = out.get("balance_no_tech_path", None)   # (D, T) dollars
-
-# If the engine is old, avoid a crash and explain
-if path_with is None or path_without is None:
-    st.warning(
-        "This deployment is using an older engine that doesn't export "
-        "`balance_path`/`balance_no_tech_path`. Update `engine.py` (see Fix 1) "
-        "and redeploy to enable the Investments chart."
-    )
-    st.stop()
-
-# Convert to $MM for plotting
-path_with = path_with / 1e6
-path_without = path_without / 1e6
-
-# Safe fetch of the threshold series
-thr = out.get("threshold_series")
-if thr is None:
-    thr = out.get("le_threshold_series")               # (T,)
-
-# Alive masks for with/without tech
-alive_with = (out["bio_age"] < thr[None, :])           # (D, T)
-cum_tech = np.cumsum(out["tech_years_by_age"], axis=1) # (D, T)
-bio_no_tech = out["bio_age"] + cum_tech                # remove tech benefit → older bio age
-alive_without = (bio_no_tech < thr[None, :])           # (D, T)
-
-def summarize(path, alive_mask, use_mean: bool, band: str):
-    """Return center line and optional percentile bands per age."""
-    D, T = path.shape
-    center = np.full(T, np.nan)
-    lo = np.full(T, np.nan)
-    hi = np.full(T, np.nan)
-    for t in range(T):
-        vals = path[alive_mask[:, t], t] if alive_weighted else path[:, t]
-        if vals.size == 0:
-            continue
-        center[t] = (np.mean(vals) if use_mean else np.median(vals))
-        if band != "None":
-            if band == "50%": p = (25, 75)
-            elif band == "80%": p = (10, 90)
-            else: p = (5, 95)
-            lo[t], hi[t] = np.percentile(vals, p)
-    return center, lo, hi
-
-m_with, lo_with, hi_with = summarize(path_with, alive_with, (avg == "Mean"), band_opt)
-if path_without is None:
-    m_without = lo_without = hi_without = None
-else:
-    m_without, lo_without, hi_without = summarize(path_without, alive_without, (avg == "Mean"), band_opt)
-
-# --- Axis end: stop at the last age where anyone is alive in the plotted selection
-def last_age_any(mask: np.ndarray) -> float:
-    idx = np.where(mask.any(axis=0))[0]
-    return float(age_grid[idx[-1]]) if idx.size else float(age_grid[-1])
-
-end_with = last_age_any(alive_with)
-end_without = last_age_any(alive_without)
-x_end = (
-    end_with if compare == "With treatments"
-    else end_without if compare == "Without treatments"
-    else max(end_with, end_without)
-)
-x_start = float(age_grid[0])
-
-# --- Chart A: portfolio value by age ---
+x_end = max(med_age_with, med_age_without)
 fig_bal = go.Figure()
-if compare in ("Both (overlay)", "With treatments"):
-    fig_bal.add_trace(go.Scatter(x=age_grid, y=m_with, mode="lines", name="With treatments"))
-if compare in ("Both (overlay)", "Without treatments") and m_without is not None:
-    fig_bal.add_trace(go.Scatter(x=age_grid, y=m_without, mode="lines", name="Without treatments"))
-
-# Show band only when not overlay (keeps it readable)
-if band_opt != "None" and compare != "Both (overlay)":
-    lo, hi = (lo_with, hi_with) if compare == "With treatments" else (lo_without, hi_without)
-    if lo is not None and hi is not None:
-        fig_bal.add_trace(go.Scatter(
-            x=np.concatenate([age_grid, age_grid[::-1]]),
-            y=np.concatenate([hi, lo[::-1]]),
-            fill="toself", line=dict(width=0), name=f"{band_opt} band",
-            hoverinfo="skip", opacity=0.18
-        ))
-
-fig_bal.update_layout(
-    title="Portfolio value by age",
-    xaxis_title="Age (years)",
-    yaxis_title="Balance ($MM)"
-)
-# ⬅️ Trim the x-axis to the real endpoint
-fig_bal.update_xaxes(range=[x_start, x_end])
-
+fig_bal.add_trace(go.Scatter(x=age_grid[mask_with],    y=m_with[mask_with],       mode="lines", name="With treatments"))
+fig_bal.add_trace(go.Scatter(x=age_grid[mask_without], y=m_without[mask_without], mode="lines", name="Without treatments"))
+fig_bal.update_layout(title="Portfolio value by age", xaxis_title="Age (years)", yaxis_title="Balance ($MM)")
+fig_bal.update_xaxes(range=[float(age_grid[0]), x_end])
 st.plotly_chart(fig_bal, use_container_width=True)
 
-# --- Chart B: Annual cash flows (optional) ---
-show_cf = st.checkbox(
-    "Show annual cash flows", value=False,
-    help="Cash into the portfolio vs expected treatment spend (excludes market returns)"
-)
-if show_cf:
-    # Dollars (not millions) for cash flows
-    contrib = out["contrib_by_year"]                         # $/yr
-    tech_spend = out.get("tech_costs_by_age")               # $/yr per draw
-    tech_spend_mean = np.zeros_like(contrib) if tech_spend is None else tech_spend.mean(axis=0)
+# 8) Cash-flow bars (optional)
+contrib = np.asarray(out["contrib_by_year"], dtype=float)                # (T,)
+spend_mean = np.zeros_like(contrib)
+if tech_spend is not None:
+    spend_mean = (tech_spend * alive_with).mean(axis=0)
+    # optional smoothing, comment out if you want raw events
+    spend_mean = pd.Series(spend_mean).rolling(3, center=True, min_periods=1).mean().to_numpy()
 
-    df_cf = pd.DataFrame({
-        "Age": age_grid,
-        "Contributions (DI − health)": contrib,
-        "Expected treatment spend": -tech_spend_mean,        # negative = outflow
-    })
-    # Trim rows beyond the endpoint
-    df_cf = df_cf[df_cf["Age"] <= x_end]
-
-    fig_cf = px.bar(
-        df_cf, x="Age",
-        y=["Contributions (DI − health)", "Expected treatment spend"],
-        barmode="relative",
-        title="Cash flows into portfolio (excluding market returns)",
-        labels={"value": "$ per year"}
-    )
-    # Format $ nicely and trim x-axis
-    fig_cf.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
-    fig_cf.update_xaxes(range=[x_start, x_end])
-
-    st.plotly_chart(fig_cf, use_container_width=True)
+m = mask_with
+df_cf = pd.DataFrame({
+    "Age": age_grid[m],
+    "Contributions (DI - health)": contrib[m],
+    "Expected treatment spend": -spend_mean[m],
+})
+fig_cf = px.bar(df_cf, x="Age",
+                y=["Contributions (DI - health)", "Expected treatment spend"],
+                barmode="relative",
+                title="Cash flows into portfolio (excluding market returns)",
+                labels={"value": "$ per year"})
+fig_cf.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
+st.plotly_chart(fig_cf, use_container_width=True)
