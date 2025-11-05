@@ -75,6 +75,66 @@ def _scale_hr(base_hr: float, adherence: float, *, mode: str = "log", curvature:
     eff = a ** max(0.1, float(curvature))
     return float(base_hr) ** eff
 
+def _parse_float(s):
+    try:
+        return float(str(s).strip().replace(",", ""))
+    except Exception:
+        return None
+
+# --- BMI risk mapper with safety + certainty flags ---
+
+# Evidence band from the meta-analysis; outside this we admit we're extrapolating
+BMI_EVIDENCE_MIN = 15.0
+BMI_EVIDENCE_MAX = 40.0
+
+# Absolute sanity bounds so typos don't nuke results
+BMI_VALID_MIN = 12.0
+BMI_VALID_MAX = 60.0
+
+# Hard cap so extreme extrapolation stays bounded
+BMI_HR_CAP = 3.0
+
+# Anchors (single minimum at 22.5), same values you already use
+BMI_HR_ANCHORS = [
+    (15.0, 2.76), (18.5, 1.13),
+    (22.5, 1.00),
+    (25.0, 1.07), (27.5, 1.20),
+    (30.0, 1.45), (35.0, 1.94), (40.0, 2.76)
+]
+
+def hr_bmi_continuous(bmi: float):
+    """
+    Return (hr, flag) where flag ∈ {"valid","extrapolated","invalid"}.
+      - invalid: outside [BMI_VALID_MIN, BMI_VALID_MAX] → ignore BMI in results
+      - extrapolated: computed outside [BMI_EVIDENCE_MIN, BMI_EVIDENCE_MAX]
+      - valid: within evidence band
+    """
+    import numpy as np
+    b = float(bmi)
+
+    # 1) Hard validity gate
+    if not (BMI_VALID_MIN <= b <= BMI_VALID_MAX):
+        return None, "invalid"
+
+    # 2) Interpolate in log(HR); linear end-slope extrapolation
+    xs = np.array([x for x,_ in BMI_HR_ANCHORS], dtype=float)
+    ys = np.log(np.array([y for _,y in BMI_HR_ANCHORS], dtype=float))
+
+    if b <= xs[0]:
+        slope = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        y = ys[0] + slope * (b - xs[0])
+    elif b >= xs[-1]:
+        slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+        y = ys[-1] + slope * (b - xs[-1])
+    else:
+        y = float(np.interp(b, xs, ys))
+
+    hr = float(np.exp(y))
+    hr = min(hr, BMI_HR_CAP)  # 3) Safety cap
+
+    flag = "valid" if (BMI_EVIDENCE_MIN <= b <= BMI_EVIDENCE_MAX) else "extrapolated"
+    return hr, flag
+
 def _combine_multipliers(mult_dict: dict[str, float]) -> float:
     import math
     total_log = 0.0
@@ -120,6 +180,70 @@ st.sidebar.header("1) Your Demographics")
 
 age = st.sidebar.number_input("Age", min_value=18, max_value=95, value=21, step=1)
 sex = st.sidebar.selectbox("Sex", ["Male", "Female"])
+
+# --- Weight status (forced exact BMI via height & weight) ---
+st.sidebar.subheader("Body Mass Index")
+
+# Units radio; hide its label to avoid clutter
+unit = st.sidebar.radio(
+    "", ["US (ft/in, lb)", "Metric (cm, kg)"],
+    index=0, horizontal=True, key="bmi_units",
+    label_visibility="collapsed"
+)
+
+bmi = None
+bmi_hr = None
+h_m = None
+kg = None
+
+if "US" in unit:
+    # Three boxes, placeholders only
+    c1, c2, c3 = st.sidebar.columns([1, 1, 1])
+    ft_s   = c1.text_input("", value="", placeholder="ft", key="ht_ft",   label_visibility="collapsed")
+    in_s   = c2.text_input("", value="", placeholder="in", key="ht_in",   label_visibility="collapsed")
+    lb_s   = c3.text_input("", value="", placeholder="lb", key="wt_lb",   label_visibility="collapsed")
+
+    ft   = _parse_float(ft_s)
+    inch = _parse_float(in_s)
+    lb   = _parse_float(lb_s)
+
+    if None not in (ft, inch, lb) and ft >= 0 and 0 <= inch < 12 and 60 <= lb <= 600:
+        h_m = (ft*12.0 + inch) * 0.0254
+        kg  = lb * 0.45359237
+else:
+    # Two boxes, placeholders only
+    c1, c2 = st.sidebar.columns(2)
+    h_cm_s = c1.text_input("", value="", placeholder="cm", key="ht_cm", label_visibility="collapsed")
+    kg_s   = c2.text_input("", value="", placeholder="kg", key="wt_kg", label_visibility="collapsed")
+
+    h_cm = _parse_float(h_cm_s)
+    kg   = _parse_float(kg_s)
+
+    if None not in (h_cm, kg) and 120.0 <= h_cm <= 230.0 and 40.0 <= kg <= 300.0:
+        h_m = h_cm / 100.0
+
+# Compute BMI only when fields are valid
+bmi_flag = None
+if h_m and kg:
+    bmi = float(kg / max(h_m*h_m, 1e-6))
+    bmi_hr, bmi_flag = hr_bmi_continuous(bmi)
+else:
+    bmi = None
+    bmi_hr = None
+
+# Persist for results/impact panels
+st.session_state["bmi"] = bmi
+st.session_state["bmi_hr"] = bmi_hr
+st.session_state["bmi_flag"] = bmi_flag
+
+# Gentle guidance in the sidebar (no scoreboard)
+if bmi_flag == "invalid":
+    st.sidebar.warning("BMI is outside supported range (12-60). Weight will be ignored in results.")
+elif bmi_flag == "extrapolated":
+    st.sidebar.caption("BMI outside evidence range (15-40). Risk extrapolated; less certain.")
+
+# Keep a stable label for downstream text/debug
+weight_label = "Exact BMI"
 
 # Default risk multipliers (HR×adherence at 100%)
 BASE_RISK_MULT = {
@@ -171,64 +295,19 @@ toggles = {}
 
 # ---- Helpful habits ----
 st.sidebar.subheader("Helpful habits")
-for name in BENEFICIAL:
-    default_on = PRESET_TOGGLES[preset].get(name, False)
-    toggles[name] = st.sidebar.checkbox(name, value=default_on, key=f"help_{name}")
 
-adherence = pct_slider(
-    "Adherence to helpful habits",
-    value_pct=75.0, step_pct=5.0, digits=0,
-    help="How likely you are to commit to your habits"
-)
-
-# ---- Harmful habits ----
-st.sidebar.subheader("Harmful habits")
-
-def harmful_block(label: str, slider_label: str, key_prefix: str):
-    """Full-width checkbox on one line; if enabled, show its slider directly below."""
-    on = st.sidebar.checkbox(
-        label,
-        value=PRESET_TOGGLES[preset].get(label, False),
-        key=f"{key_prefix}_on"
-    )
-    intensity = 0.0
+def helpful_block(label: str, key_prefix: str, default_on: bool):
+    """Checkbox on one line; if enabled, show adherence slider directly below (percent)."""
+    on = st.sidebar.checkbox(label, value=default_on, key=f"{key_prefix}_on")
+    a = 0.0
     if on:
-        intensity = pct_slider(
-            f"{slider_label}",
-            value_pct=100.0, step_pct=10.0, digits=0,
-            key=f"{key_prefix}_intensity",
-            help="How frequently or heavily you do this habit"
+        a = pct_slider(
+            "Adherence",
+            value_pct=75.0, step_pct=5.0, digits=0,
+            key=f"{key_prefix}_adh",
+            help="How consistently you do this habit"
         )
-    return on, intensity
-
-# Each harmful toggle sits on one line; slider appears directly underneath
-smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "Smoking intensity",  "smoke")
-drink_on, drink_exposure = harmful_block("Heavy Drinking", "Drinking intensity", "drink")
-
-# Keep these in toggles for the rest of the app
-toggles["Heavy Smoking"]  = smoke_on
-toggles["Heavy Drinking"] = drink_on
-
-# --- Weight status (mutually exclusive) ---
-st.sidebar.subheader("Weight status")
-weight_label = st.sidebar.selectbox(
-    "Pick one",
-    ["None / Healthy Range",
-     "Overweight (BMI 27.5-29.9)",
-     "High Body Weight (BMI 30-34.9)",
-     "Very High Body Weight (BMI ≥35)"],
-    index=0,
-    help="If BMI doesn't fit you (e.g., very muscular), use waist instead: central obesity = waist-to-height ≥ 0.6 or waist ≥ 102 cm (men) / 88 cm (women)"
-)
-
-WEIGHT_HR = {
-    "None / Healthy Range":            1.00,
-    "Overweight (BMI 27.5-29.9)":      1.20,  # Lancet IPD meta-analysis
-    "High Body Weight (BMI 30-34.9)":  1.45,
-    "Very High Body Weight (BMI ≥35)": 1.94,
-}
-
-# Final multipliers to feed engine (Excel rule)
+    return on, a
 
 # Canonical keys so UI labels, costs, and HR multipliers stay in sync
 CANON = {
@@ -243,6 +322,45 @@ CANON = {
     "Weight status":            "weight",
 }
 
+helpful_adh = {}  # canonical_key -> adherence in [0,1]
+for name in BENEFICIAL:
+    key = CANON[name]  # keep keys stable across UI/engine/costs
+    default_on = PRESET_TOGGLES[preset].get(name, False)
+    on, a = helpful_block(name, f"help_{key}", default_on)
+    toggles[name] = on
+    if on:
+        helpful_adh[key] = a
+
+# ---- Harmful habits ----
+st.sidebar.subheader("Harmful habits")
+
+def harmful_block(label: str, key_prefix: str):
+    """Full-width checkbox on one line; if enabled, show its slider directly below."""
+    on = st.sidebar.checkbox(
+        label,
+        value=PRESET_TOGGLES[preset].get(label, False),
+        key=f"{key_prefix}_on"
+    )
+    exposure = 0.0
+    if on:
+        exposure = pct_slider(
+            "Exposure",
+            value_pct=100.0, step_pct=5.0, digits=0,
+            key=f"{key_prefix}_exposure",
+            help="Percentage of the time or dose you're exposed to"
+        )
+    return on, exposure
+
+# Each harmful toggle sits on one line; slider appears directly underneath
+smoke_on, smoke_exposure = harmful_block("Heavy Smoking",  "smoke")
+drink_on, drink_exposure = harmful_block("Heavy Drinking", "drink")
+
+# Keep these in toggles for the rest of the app
+toggles["Heavy Smoking"]  = smoke_on
+toggles["Heavy Drinking"] = drink_on
+
+# Final multipliers to feed engine (Excel rule)
+
 intervention_on = {}
 lifestyle_HRs = {}
 for name, base in BASE_RISK_MULT.items():
@@ -253,8 +371,8 @@ for name, base in BASE_RISK_MULT.items():
     if not on or base == 1.0:
         m = 1.0
     elif base < 1.0:
-        # inside the multipliers loop, helpful branch
-        m = _scale_hr(base, adherence, mode=scaling_mode)
+        a = helpful_adh.get(key, 0.0)  # if off or not set, 0.0 gives m=1.0 in practice due to earlier 'on' gate
+        m = _scale_hr(base, a, mode=scaling_mode)
     else:
         # Harmful exposure → scale by exposure on the log-hazard scale
         if key == "smoker":
@@ -267,13 +385,19 @@ for name, base in BASE_RISK_MULT.items():
 
     lifestyle_HRs[key] = float(m)
 
-# Add Weight status as its own factor (scaled by the same adherence rule)
-w_on = (weight_label != "None / Healthy Range")
-base_w = WEIGHT_HR[weight_label]
-w_mult = base_w if w_on else 1.0  # weight is a state/exposure → no adherence scaling
+# Add Weight status as its own factor (exact BMI only; off until BMI is valid)
+if bmi_hr is not None:
+    w_on = True
+    w_mult = float(bmi_hr)
+else:
+    w_on = False
+    w_mult = 1.0  # neutral until user enters data
 
-lifestyle_HRs["weight"] = float(w_mult)
-intervention_on["weight"] = bool(w_on)
+lifestyle_HRs["weight"] = w_mult
+intervention_on["weight"] = w_on
+
+# ------------------ Sidebar: finance ------------------
+st.sidebar.header("3) Your Finances")
 
 # ------------------ Sidebar: habit costs (annual only) ------------------
 with st.sidebar.expander("Health Habit Costs", expanded=False):
@@ -319,8 +443,6 @@ with st.sidebar.expander("Health Habit Costs", expanded=False):
         for k in ORDER
     }
 
-# ------------------ Sidebar: finance ------------------
-st.sidebar.header("3) Your Finances")
 start_capital = st.sidebar.number_input("Starting Capital ($)", min_value=0, value=10_000, step=1_000)
 di0 = st.sidebar.number_input("Yearly Spending Budget ($)", min_value=0, value=10_000, step=1_000)
 ret = pct_slider("Portfolio Return", min_pct=0.0, max_pct=15.0,
@@ -375,18 +497,42 @@ seed = st.sidebar.number_input("Random Seed (reproducible)", min_value=0, max_va
 import hashlib, json
 
 def _hash_inputs():
+    # Pull BMI-related fields from session state (they exist even when empty)
+    bmi_val = st.session_state.get("bmi")
+    bmi_hr  = st.session_state.get("bmi_hr")
+    units   = st.session_state.get("bmi_units")  # "US (ft/in, lb)" or "Metric (cm, kg)"
+    # Raw text boxes, so a single keystroke clears stale results
+    ft_s  = st.session_state.get("ht_ft")
+    in_s  = st.session_state.get("ht_in")
+    lb_s  = st.session_state.get("wt_lb")
+    hcm_s = st.session_state.get("ht_cm")
+    kg_s  = st.session_state.get("wt_kg")
+
     cfg = dict(
         age=int(age), sex=str(sex),
         scaling_mode=scaling_mode,
         preset=str(preset),
         toggles=toggles,
-        adherence=float(adherence),
+        helpful_adh=helpful_adh,
+        adherence=1.0,
+
+        # Harmful exposures
         smoke_on=bool(smoke_on), smoke_exposure=float(smoke_exposure),
         drink_on=bool(drink_on), drink_exposure=float(drink_exposure),
+
+        # BMI inputs (both derived and raw so any edit clears results)
+        bmi=bmi_val, bmi_hr=bmi_hr, bmi_units=units,
+        ht_ft=ft_s, ht_in=in_s, wt_lb=lb_s, ht_cm=hcm_s, wt_kg=kg_s,
+
+        # Legacy label kept for stability (always "Exact BMI" now)
         weight_label=str(weight_label),
+
+        # Longevity + finance
         lambdaP=float(lambda_plateau), drift=float(drift_days),
         le_trend=float(le_improve), frontier=float(max_age_today),
         ret=float(ret), di0=float(di0), hc=float(hc_infl),
+
+        # Tech tiers
         tier1=dict(cost=tier1.cost_today, years=tier1.years_gain, p=tier1.base_prob,
                    g=tier1.growth_per_year, cap=tier1.cap_prob),
         tier2=dict(cost=tier2.cost_today, years=tier2.years_gain, p=tier2.base_prob,
@@ -449,7 +595,7 @@ if st.sidebar.button("Run Simulation", type="primary", use_container_width=True)
         max_age_today=int(max_age_today),
         hc_inflation=float(hc_infl),
         lifestyle_HRs=lifestyle_HRs,
-        adherence=float(adherence),
+        adherence=1.0,
         tiers=[tier1, tier2, tier3],
         tier_repeatable=True,                 # repeatable breakthroughs
         intervention_costs=intervention_costs,
@@ -511,6 +657,99 @@ with col3:
         f"{yrs_from_tech:.1f} years",
         help="Alive-weighted expected years from Tier 1-3 purchases, gated by your budget and arrival probabilities"
     )
+
+# ---------- Impact analysis (local counterfactual) ----------
+with st.expander("What helped or hurt most?", expanded=False):
+    st.caption("We re-run your profile once per factor, setting that factor to **baseline (risk ×1.00)**, and report how your " \
+    "**median lifespan** would change. “Risk ×1.10” means 10% higher yearly death risk; “×0.90” means 10% lower.")
+
+    # Keep runs fast but stable
+    draws_impact = int(min(draws, 4000))  # smaller than main run, same seed for low noise
+
+    # Helper to rebuild Inputs with a different lifestyle_HRs dict
+    def _inputs_with(lhr: dict) -> Inputs:
+        return Inputs(
+            start_age=int(age),
+            sex=sex,
+            draws=draws_impact,
+            investment_return=float(ret),
+            start_capital=float(start_capital),
+            discretionary_income=float(di0),
+            income_growth=float(income_growth),
+            annual_contrib=0.0,
+            contrib_growth=0.0,
+            lambdaP=float(lambda_plateau),
+            frontier_drift_days=float(drift_days),
+            le_trend=float(le_improve),
+            max_age_today=int(max_age_today),
+            hc_inflation=float(hc_infl),
+            lifestyle_HRs=lhr,
+            adherence=1.0,
+            tiers=[tier1, tier2, tier3],
+            tier_repeatable=True,
+            intervention_costs=intervention_costs,
+            intervention_on=intervention_on,
+            grid_max_age=max(int(age) + 126, 170),
+            seed=int(seed),  # same seed → differences reflect the factor
+        )
+
+    # Build label map once
+    LABEL_FOR = {v: k for k, v in CANON.items()}
+
+    rows = []
+    for key, hr_now in lifestyle_HRs.items():
+        # Skip neutral factors and disabled ones
+        if not intervention_on.get(key, False):
+            continue
+        if abs(float(hr_now) - 1.0) < 1e-9:
+            continue
+
+        lhr2 = dict(lifestyle_HRs)
+        lhr2[key] = 1.0  # neutralize this factor only
+
+        out_i = run_monte_carlo(_inputs_with(lhr2))
+        med_i = float(np.median(out_i["projected_life"]))
+
+        # Effect if we removed the factor: positive = it’s hurting you now; negative = it’s helping you now.
+        effect = med_i - median_life
+
+        rows.append({
+            "Factor": LABEL_FOR.get(key, key).replace("Weight status", "BMI"),
+            "Risk ×": f"×{float(hr_now):.2f}",
+            "Δ Median years if removed": effect
+        })
+
+    if not rows:
+        st.info("No active factors to analyze yet")
+    else:
+        df_imp = pd.DataFrame(rows)
+
+        # Rank lists
+        bad  = df_imp.sort_values("Δ Median years if removed", ascending=False).head(5)
+        good = df_imp.sort_values("Δ Median years if removed", ascending=True).head(5)
+
+        # Drop the pandas row index so the leftmost 0–4 vanishes
+        bad  = bad.reset_index(drop=True)
+        good = good.reset_index(drop=True)
+
+        # Lock the visible column order (optional but nice)
+        cols = ["Factor", "Risk ×", "Δ Median years if removed"]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Biggest drag right now**")
+            st.dataframe(
+                bad[cols],
+                use_container_width=True,
+                hide_index=True
+            )
+        with c2:
+            st.markdown("**Biggest boost right now**")
+            st.dataframe(
+                good[cols],
+                use_container_width=True,
+                hide_index=True
+            )
     
 # ================== Lifespan + Wealth controls (row 1) ==================
 ctrl_l, ctrl_r = st.columns(2)
